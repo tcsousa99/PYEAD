@@ -1,0 +1,15 @@
+mip_amu = 2.016
+mni = 1.0
+mnp = 1.0
+alphadeg = 85.0
+Te = 25.0
+B = 2.0
+Zip = 1.0
+Zii = 6.0
+ne = 1.0e19
+n_ions = 500
+mii_amu = 12.0
+Ti = 25.0
+forceds = 0.0
+lmps = 2.0
+pal = 2
