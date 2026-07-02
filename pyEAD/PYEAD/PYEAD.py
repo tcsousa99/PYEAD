@@ -17,11 +17,22 @@
 #
 #############################################################################
 
+import os
+# Prevent BLAS/OpenMP libraries (OpenBLAS, MKL) from spawning their own
+# threads inside each joblib worker process. Without this, N worker
+# processes x M BLAS threads each will oversubscribe your CPU cores, and
+# runs with more cores can end up NO FASTER or even SLOWER than fewer
+# cores. This must be set before numpy is imported.
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+
 import numpy as np
 import math
 import matplotlib
 import matplotlib.pyplot as plt
-from scipy.integrate import solve_ivp
+from scipy.integrate import solve_ivp  # no longer used in the hot path, kept for compatibility
 import time
 from joblib import Parallel, delayed
 from netCDF4 import Dataset
@@ -502,9 +513,9 @@ class pyead():
 
 			# Calculate next velocities
 			result = self.RK4(tim=tim[k],vx=vx[k],vy=vy[k],vz=vz[k],Ey=Ey,dt=dt[k])
-			vx[k+1]=result.y[0][0]
-			vy[k+1]=result.y[1][0]
-			vz[k+1]=result.y[2][0]
+			vx[k+1]=result[0]
+			vy[k+1]=result[1]
+			vz[k+1]=result[2]
 
 			speed[k+1] = np.sqrt(vx[k+1]**2.0+vy[k+1]**2.0+vz[k+1]**2.0)
 			ke[k+1] = 0.5*self.mii*(speed[k+1]**2.0)/self.e
@@ -571,14 +582,24 @@ class pyead():
 
 	def RK4(self,tim,vx,vy,vz,Ey,dt):
 		#4th order Runge-Kutta method for calculating velocity
+		#NOTE: previously this called scipy.integrate.solve_ivp with the
+		#'RK45' adaptive solver to take a single tiny fixed-size step. That
+		#per-call setup (solver object creation, step-size control, dense
+		#output interpolation) is very expensive when invoked tens of
+		#thousands of times per particle. self.DVS does not depend on t and
+		#Ey is fixed over a step, so a direct fixed-step RK4 (matching the
+		#method's own name) gives numerically equivalent results at a small
+		#fraction of the cost.
 		H = dt
-		t = tim
-		pvx = vx
-		pvy = vy
-		pvz = vz
-		PV = np.array([pvx,pvy,pvz])
-		result = solve_ivp(lambda x, y: self.DVS(x,y,Ey),[t,t+2*H],PV,'RK45',t_eval=[t+H],first_step=H)
-		return result
+		PV = np.array([vx,vy,vz])
+
+		k1 = self.DVS(tim,PV,Ey)
+		k2 = self.DVS(tim+0.5*H,PV+0.5*H*k1,Ey)
+		k3 = self.DVS(tim+0.5*H,PV+0.5*H*k2,Ey)
+		k4 = self.DVS(tim+H,PV+H*k3,Ey)
+
+		PV_new = PV + (H/6.0)*(k1+2.0*k2+2.0*k3+k4)
+		return PV_new
 
 	def write_particle(self,k_flag,k,ke,xpos,ypos,zpos,vx0,vy0,vz0,vx,vy,vz,perpind,parind,n):
 
