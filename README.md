@@ -120,8 +120,8 @@ The order of operation in calc_EAD is the following:
 Results from calc_EAD can be output in two major file dumps:
 
 ```
-data.output_plots()
-data.output_write()
+data.write_plots()
+data.write_out()
 ```
 
 data.output_plots is used to plot a few standard distributions, and can be used with optional inputs:
