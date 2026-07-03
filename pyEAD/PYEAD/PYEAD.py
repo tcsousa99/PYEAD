@@ -15,6 +15,21 @@
 #
 # Validated against: ieadrk3.pro updates through Abe 2022
 #
+# Performance/robustness edits in this version:
+#   * Per-particle sheath integration is compiled with numba (@njit) and
+#     lives in the module-level function _integrate_trajectory. If numba
+#     is not installed the same code runs (interpreted) via a no-op
+#     fallback decorator.
+#   * The per-step E-field lookup uses direct index arithmetic on the
+#     uniform Y grid instead of np.argmin, and the index is CLAMPED to
+#     [0, ndvis-1] (reproducing np.argmin's implicit clamping and fixing
+#     the IndexError seen when the trajectory rises above the grid top).
+#   * The Y-grid length is exposed as an input (Ylen). It defaults to the
+#     original 10 mm so existing/validated results are reproduced exactly.
+#     A diagnostic warns, using r_d and the ion Larmor radius from the
+#     user's inputs, when the trajectory can exceed the grid so low-
+#     density runs can enlarge Ylen and place the full path on-grid.
+#
 #############################################################################
 
 import os
@@ -37,6 +52,21 @@ import time
 from joblib import Parallel, delayed
 from netCDF4 import Dataset
 
+# --- numba (optional): compiles the per-particle integrator to machine ---
+# code. If it is missing, the same function runs interpreted (slower) via
+# a no-op decorator, so the module still imports and runs.
+try:
+	from numba import njit
+	_HAVE_NUMBA = True
+except Exception:
+	_HAVE_NUMBA = False
+	def njit(*dargs, **dkwargs):
+		if len(dargs) == 1 and callable(dargs[0]) and not dkwargs:
+			return dargs[0]
+		def _wrap(fn):
+			return fn
+		return _wrap
+
 plt.rcParams.update({
         "font.size": 20,        # base font size
 	"font.weight": 'bold',
@@ -49,8 +79,115 @@ plt.rcParams.update({
         "legend.fontsize": 20,
 })
 
+
+# cache=True persists the compiled code to disk so that, under joblib's
+# process-based parallelism, only the first worker pays the compile cost
+# and the others load it. fastmath=False keeps bit-for-bit fidelity with
+# the original arithmetic; set it True for a little more speed once you
+# trust the results.
+@njit(cache=True, fastmath=False)
+def _integrate_trajectory(E_y, ndvis, Y0, dY,
+                          qm, Bx, By, Bz, mii, e_charge, r_d,
+                          r_gyro, domain_max, ypos0,
+                          vx0, vy0, vz0, init_dt):
+	"""Push one test particle through the sheath. Returns
+	(k, xpos, ypos, zpos, vx, vy, vz, ke) with the arrays filled up to
+	index k, matching what write_particle expects so it works unchanged.
+
+	This reproduces the original monte_carlo_EAD inner loop exactly, with
+	two changes: (1) the E-field grid index is computed arithmetically and
+	CLAMPED to the valid range, and (2) the loop is numba-compiled."""
+
+	xpos = np.zeros(ndvis)
+	ypos = np.zeros(ndvis)
+	zpos = np.zeros(ndvis)
+	vx = np.zeros(ndvis)
+	vy = np.zeros(ndvis)
+	vz = np.zeros(ndvis)
+	ke = np.zeros(ndvis)
+
+	vx[0] = vx0
+	vy[0] = vy0
+	vz[0] = vz0
+	ypos[0] = ypos0
+
+	speed_k = math.sqrt(vx0 * vx0 + vy0 * vy0 + vz0 * vz0)
+	ke[0] = 0.5 * mii * speed_k * speed_k          # Joules (as in original)
+
+	n_edge = ndvis - 1
+	k = 0
+	while (ypos[k] > 0.0) and (ypos[k] < domain_max) and (k < ndvis - 2):
+
+		# ---- update_time: base is always the constant init_dt ----------
+		dt = init_dt
+		if ypos[k] < 2.0 * r_gyro:
+			dt = 10.0 * r_d / speed_k
+		if ypos[k] < 5.0 * r_d:
+			dt = 0.25 * r_d / speed_k
+
+		# ---- E-field lookup: O(1) nearest index on the uniform Y grid --
+		# Y[i] = Y0 + i*dY, so the nearest index is arithmetic. The clamp
+		# reproduces np.argmin's behaviour when ypos leaves the grid
+		# (returns the boundary index) and prevents the out-of-range
+		# IndexError.
+		idx = int(math.floor((ypos[k] - Y0) / dY + 0.5))
+		if idx < 0:
+			idx = 0
+		elif idx > n_edge:
+			idx = n_edge
+		Ey = E_y[idx]
+
+		vxk = vx[k]
+		vyk = vy[k]
+		vzk = vz[k]
+
+		# ---- Newton position updates (old velocities, updated dt) ------
+		xpos[k + 1] = xpos[k] + vxk * dt + 0.5 * (qm * (Bz * vyk - By * vzk)) * dt * dt
+		ypos[k + 1] = ypos[k] + vyk * dt + 0.5 * (qm * (Ey - Bz * vxk + Bx * vzk)) * dt * dt
+		zpos[k + 1] = zpos[k] + vzk * dt + 0.5 * (qm * (vxk * By - vyk * Bx)) * dt * dt
+
+		# ---- RK4 velocity update (DVS is t-independent; Ey fixed) ------
+		a1x = qm * (Bz * vyk - By * vzk)
+		a1y = qm * (Ey - Bz * vxk + Bx * vzk)
+		a1z = qm * (vxk * By - vyk * Bx)
+
+		bx = vxk + 0.5 * dt * a1x
+		by = vyk + 0.5 * dt * a1y
+		bz = vzk + 0.5 * dt * a1z
+		a2x = qm * (Bz * by - By * bz)
+		a2y = qm * (Ey - Bz * bx + Bx * bz)
+		a2z = qm * (bx * By - by * Bx)
+
+		cx = vxk + 0.5 * dt * a2x
+		cy = vyk + 0.5 * dt * a2y
+		cz = vzk + 0.5 * dt * a2z
+		a3x = qm * (Bz * cy - By * cz)
+		a3y = qm * (Ey - Bz * cx + Bx * cz)
+		a3z = qm * (cx * By - cy * Bx)
+
+		ex = vxk + dt * a3x
+		ey_ = vyk + dt * a3y
+		ez = vzk + dt * a3z
+		a4x = qm * (Bz * ey_ - By * ez)
+		a4y = qm * (Ey - Bz * ex + Bx * ez)
+		a4z = qm * (ex * By - ey_ * Bx)
+
+		vx[k + 1] = vxk + (dt / 6.0) * (a1x + 2.0 * a2x + 2.0 * a3x + a4x)
+		vy[k + 1] = vyk + (dt / 6.0) * (a1y + 2.0 * a2y + 2.0 * a3y + a4y)
+		vz[k + 1] = vzk + (dt / 6.0) * (a1z + 2.0 * a2z + 2.0 * a3z + a4z)
+
+		speed_k = math.sqrt(vx[k + 1] * vx[k + 1] +
+		                    vy[k + 1] * vy[k + 1] +
+		                    vz[k + 1] * vz[k + 1])
+		ke[k + 1] = 0.5 * mii * (speed_k * speed_k) / e_charge   # eV (as in original)
+
+		k += 1
+
+	return k, xpos, ypos, zpos, vx, vy, vz, ke
+
+
 class pyead():
-	def __init__(self,source=True,path=None,alphadeg=None,mii_amu=None,mip_amu=None,mni=None,mnp=None,Te=None,Ti=None,B=None,Zip=None,Zii=None,ne=None,n_ions=None,out=None,name=None,forceds=None,noe=None,lmps=None,pal=None,ndvis=None):
+	def __init__(self,source=True,path=None,alphadeg=None,mii_amu=None,mip_amu=None,mni=None,mnp=None,Te=None,Ti=None,B=None,Zip=None,Zii=None,ne=None,n_ions=None,out=None,name=None,forceds=None,noe=None,lmps=None,pal=None,ndvis=None,Ylen=None):
 
 		#The input values will be assigned in the following priority: 
 		# Will check if source file is expected. If True, will read PYEAD_input input file for parameters. If False, will assign default values to all parameters except any values specified when creating the class instance.
@@ -59,7 +196,12 @@ class pyead():
 
 		if source == True:
 			if path is not None:
-				inputfile = path+'/PYEAD_input'
+				# Accept either a full path to a specific deck file, or a
+				# directory that contains a file named 'PYEAD_input'.
+				if os.path.isfile(path):
+					inputfile = path
+				else:
+					inputfile = os.path.join(path, 'PYEAD_input')
 				try:
 					with open(inputfile,'r') as f: #Will try to find and read PYEAD_input in path
 						print(f'PYEAD_input found in {path}. Using values as specified.')
@@ -178,6 +320,11 @@ class pyead():
 		elif not hasattr(self,'ndvis'):
 			self.ndvis = 50000 #Set number of numerical divisions for sheath distance normal to surface
 
+		if Ylen is not None:
+			self.Ylen = Ylen
+		elif not hasattr(self,'Ylen'):
+			self.Ylen = 0.010 #Total Y-grid length normal to surface [m]. Default 10mm reproduces the original grid; raise for low-density (large r_d / large Larmor radius) cases. See diagnostic below.
+
 		#Verify precision
 		self.mip_amu = np.double(self.mip_amu)
 		self.mni = np.double(self.mni)
@@ -192,6 +339,7 @@ class pyead():
 		self.Ti = np.double(self.Ti)
 		self.forceds = np.double(self.forceds)
 		self.lmps = np.double(self.lmps)
+		self.Ylen = np.double(self.Ylen)
 
 		self.n_ions = int(self.n_ions)
 		self.pal = int(self.pal)
@@ -229,12 +377,31 @@ class pyead():
 		self.alpha_star = np.arccos(np.sqrt(2.0*np.pi*(self.me/self.mip)*(1.0+(self.Ti/self.Te))))*(180.0/np.pi) #Critical angle above which Debye sheath vanishes
 		self.lamb_norm = self.kb*self.Te/self.e #Normalization constant for e-field strength lambda=e(phi-phi0)/(kb*Te)
 
+		#Diagnostic: estimate the maximum height the trajectory can reach.
+		#This mirrors the upper bound in the monte_carlo integration loop,
+		#  domain = 10*L_mps*r_d*3/lmps + 2*r_gyro*sin(alpha)
+		#         = 30*R_ics*sin(alpha) + 2*r_gyro*sin(alpha),
+		#with the per-particle gyro term bounded by ~6 thermal-ion Larmor
+		#radii to cover the velocity tail. If this exceeds the grid length
+		#Ylen, particles above the grid use the clamped far-field (~0),
+		#which is a good approximation only if the E-field has already
+		#decayed there. For low-density runs, enlarge Ylen as suggested.
+		sin_a = np.sin(self.alpha)
+		self.y_ceiling = 30.0*self.R_ics*sin_a + 2.0*(6.0*self.R_iimp)*sin_a
+		if self.y_ceiling > self.Ylen:
+			rec = 1.25*self.y_ceiling
+			print('[PYEAD] NOTE: r_d = {:.3f} mm; estimated trajectory ceiling ~{:.2f} mm '
+			      'exceeds the Y-grid length ({:.2f} mm).'.format(self.r_d*1e3, self.y_ceiling*1e3, self.Ylen*1e3))
+			print('[PYEAD]       Particles above the grid top use the clamped far-field. '
+			      'To place the full trajectory on-grid, set Ylen ~ {:.4f} m '
+			      '(e.g. add "Ylen = {:.4f}" to PYEAD_input).'.format(rec, rec))
+
 		self.initialize_distances()
 
 		self.name = 'output'
 
 	def initialize_distances(self):
-		self.Y = np.double(np.linspace(0.0,float(self.ndvis)-1.0,self.ndvis)/float(self.ndvis) * 0.010) #0.010 Y vector normal to surface, 10mm total length
+		self.Y = np.double(np.linspace(0.0,float(self.ndvis)-1.0,self.ndvis)/float(self.ndvis) * self.Ylen) #Y vector normal to surface, total length = self.Ylen [m]
 		self.lamb = np.double(np.linspace(0.0,float(self.ndvis)-1.0,self.ndvis)) #Electric potential at the same
 		self.xsi = self.Y/self.r_d #dimensionless distance
 		print('Y and lamb reset')
@@ -446,7 +613,11 @@ class pyead():
 				self.partsum[i]['EI'] = self.totale[i]
 
 	def monte_carlo_EAD(self,n,verbose=True):
-		#Calculates the Energy and Angles of test particle n
+		#Calculates the Energy and Angles of test particle n.
+		#The inner sheath integration is delegated to the numba-compiled
+		#module-level function _integrate_trajectory; this method only sets
+		#up per-particle inputs and hands the results to write_particle, so
+		#the returned tuple is identical to the original.
 
 		if verbose==True:
 			#Show how far along you are...
@@ -461,68 +632,44 @@ class pyead():
 		perpind = np.argmin(abs(self.vbinloc-v_perp))
 		parind = np.argmin(abs(self.vbinloc-v_par))
 
+		#Gyro-radius branch matches the original. NOTE: the equations of
+		#motion always used qii/mii, so qm is qii/mii regardless of which
+		#branch sets r_gyro.
 		if (self.mii_amu is not None) and (self.mii != self.mip):
 			r_gyro = self.mii*v_perp/(self.qii*self.B)
 		else:
 			r_gyro = self.mip*v_perp/(self.qi*self.B)
+		qm = self.qii/self.mii
 
 		vx0 = -v_perp*np.cos(self.bigomega_rand[n]) #out of B-E plane
 		vy0 = v_perp*np.sin(self.bigomega_rand[n])*np.sin(self.alpha)-v_par*np.cos(self.alpha) #in E-direction
 		vz0 = v_par*np.sin(self.alpha)-v_perp*np.sin(self.bigomega_rand[n])*np.cos(self.alpha) #ion sound speed in B-direction
 
-		#Generate variables and initialize
-		dt = np.zeros(self.ndvis,dtype=np.double) #time step
-		vx = np.zeros(self.ndvis,dtype=np.double) #x velocity
-		vy = np.zeros(self.ndvis,dtype=np.double) #y velocity
-		vz = np.zeros(self.ndvis,dtype=np.double) #z velocity
-		ypos = np.zeros(self.ndvis,dtype=np.double) #y position
-		xpos = np.zeros(self.ndvis,dtype=np.double) #x position
-		zpos = np.zeros(self.ndvis,dtype=np.double) #z position
-		speed = np.zeros(self.ndvis,dtype=np.double) #speed of particle
-		ke = np.zeros(self.ndvis,dtype=np.double) #kinetic energy of particle
-		tim = np.zeros(self.ndvis,dtype=np.double) #time
+		speed0 = np.sqrt(vx0**2.0+vy0**2.0+vz0**2.0)
+		init_dt = (0.01*2.0*np.pi*r_gyro)/speed0
 
-		vx[0] = vx0 #out of B-E plane
-		vy[0] = vy0 #in E-direction
-		vz[0] = vz0 #in B-direction
+		#Start particle at position where electric field is 0.03 (1% of max
+		#normalized field of lambda=3), plus one orbit diameter so the
+		#bottom of the orbit just dips into the mpsheath. Same as original.
+		below = np.where(self.lamb < -0.03)[0]
+		ypos0 = self.xsi[below.max()]*self.r_d + 2.0*r_gyro*np.sin(self.alpha)
 
-		#Start particle at position where electric field is 0.03 (1% of max normalized field of lambda=3)
-		ypos[0] = (self.xsi[max([i for i, j in enumerate(self.lamb) if j<-0.03])])*self.r_d
-		#Add one orbit diameter above this 1% level so that bottom of the orbit just dips into the mpsheath
-		ypos[0] += 2.0*r_gyro*np.sin(self.alpha)
+		#Upper bound of the integration domain (constant per particle),
+		#identical to the original while-loop test.
+		domain_max = 10.0*self.L_mps*self.r_d*3.0/self.lmps + 2.0*r_gyro*np.sin(self.alpha)
 
-		speed[0] = np.sqrt(vx0**2.0+vy0**2+vz0**2)
-		ke[0] = 0.5*self.mii*speed[0]**2
+		#Uniform-grid parameters for the O(1), clamped E-field lookup.
+		Y0 = float(self.Y[0])
+		dY = float(self.Y[1]-self.Y[0])
 
-		#Track ion trajectories through layers of the sheath
-		k=0
-		dt = np.double(np.array([(0.01*2.0*np.double(np.pi)*r_gyro)/np.sqrt(vx0**2.0+vy0**2.0+vz0**2.0)]*self.ndvis))
+		E_y = np.ascontiguousarray(self.E_y, dtype=np.float64)
 
-		while (ypos[k] > 0.0) and (ypos[k] < 10.0*self.L_mps*self.r_d*3.0/self.lmps+2.0*r_gyro*np.sin(self.alpha)) and (k < self.ndvis-2):
-
-			dt[k] = self.update_time(ypos=ypos[k],r_gyro=r_gyro,speed=speed[k],init_dt=dt[k]) #Update timestep
-
-			# Find E-field at current position
-			Eind = np.argmin(abs(self.Y-ypos[k]))
-			Ey = 1.0*self.E_y[Eind]
-
-			# Calculate next positions
-			xpos[k+1] = self.NMx(xpos=xpos[k],vx=vx[k],vy=vy[k],vz=vz[k],dt=dt[k])
-			ypos[k+1] = self.NMy(ypos=ypos[k],vx=vx[k],vy=vy[k],vz=vz[k],dt=dt[k],Ey=Ey)
-			zpos[k+1] = self.NMz(zpos=zpos[k],vx=vx[k],vy=vy[k],vz=vz[k],dt=dt[k])
-
-			# Calculate next velocities
-			result = self.RK4(tim=tim[k],vx=vx[k],vy=vy[k],vz=vz[k],Ey=Ey,dt=dt[k])
-			vx[k+1]=result[0]
-			vy[k+1]=result[1]
-			vz[k+1]=result[2]
-
-			speed[k+1] = np.sqrt(vx[k+1]**2.0+vy[k+1]**2.0+vz[k+1]**2.0)
-			ke[k+1] = 0.5*self.mii*(speed[k+1]**2.0)/self.e
-
-			tim[k+1] = tim[k]+dt[k]
-
-			k += 1
+		k, xpos, ypos, zpos, vx, vy, vz, ke = _integrate_trajectory(
+			E_y, int(self.ndvis), Y0, dY,
+			float(qm), float(self.Bx), float(self.By), float(self.Bz),
+			float(self.mii), float(self.e), float(self.r_d),
+			float(r_gyro), float(domain_max), float(ypos0),
+			float(vx0), float(vy0), float(vz0), float(init_dt))
 
 		if k < self.ndvis-2:
 			k_flag = True
@@ -546,7 +693,8 @@ class pyead():
 		return np.double(y)
 
 	def DVS(self,t,PV,Ey):
-		#Equations of motion
+		#Equations of motion (kept for compatibility; the hot path uses the
+		#inlined version inside _integrate_trajectory)
 		vx = PV[0]
 		vy = PV[1]
 		vz = PV[2]
@@ -556,6 +704,7 @@ class pyead():
 		return np.array([ax,ay,az])
 
 	def update_time(self,ypos,r_gyro,speed,init_dt):
+		#Kept for compatibility; the hot path inlines this logic.
 		dt = init_dt
 		#Update timestep if position is within 2 gyro-orbits of surface
 		if ypos < 2.0*r_gyro:
@@ -590,6 +739,8 @@ class pyead():
 		#Ey is fixed over a step, so a direct fixed-step RK4 (matching the
 		#method's own name) gives numerically equivalent results at a small
 		#fraction of the cost.
+		#Kept for compatibility; the hot path inlines this inside
+		#_integrate_trajectory.
 		H = dt
 		PV = np.array([vx,vy,vz])
 
