@@ -603,7 +603,18 @@ class pyead():
 
 			#Calculate total kinetic energy of ions entering sheath
 			self.totale = 0.5*self.mii*(self.vparvec**2+self.vperpvec**2)/self.kb
-			maxebin = max(self.totale)*3.0
+			#Energy an ion of charge Zii gains falling through the sheath.
+			#The wall sits at normalized potential lamb_w (in units of
+			#kTe/e), so the drop in volts is |lamb_w|*Te and the energy
+			#gained is Zii*|lamb_w|*Te [eV]. The impact energy is roughly
+			#the entrance energy plus this, so the histogram axis must reach
+			#it; otherwise every final ion overflows into the top bin (the
+			#spike-at-the-edge artifact and the empty 2D energy plots).
+			#Taking the max with the original 3*entrance scale leaves
+			#previously-validated high-Te cases -- where the entrance energy
+			#already dominated -- unchanged.
+			sheath_dE = self.Zii*abs(self.lamb_w)*self.Te
+			maxebin = max(max(self.totale)*3.0, (max(self.totale)+sheath_dE)*1.5)
 			self.ebinloc = np.double(np.linspace(0.0,180.0-1.0,180))/180.0*maxebin
 
 			#Fill in particle initial values:
